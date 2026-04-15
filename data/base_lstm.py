@@ -25,16 +25,16 @@ BASE         = os.path.dirname(os.path.abspath(__file__))
 ATLANTIC_CSV = os.path.join(BASE, "csv", "atlantic.csv")
 PACIFIC_CSV  = os.path.join(BASE, "csv", "pacific.csv")
 
-SEQ_LEN      = 4        # input window (4 x 6h = 24h of history)
+SEQ_LEN      = 12       # input window (12 x 6h = 72h of history)
 HORIZON      = 4        # forecast steps ahead: +6h, +12h, +18h, +24h
 BATCH_SIZE   = 64
-EPOCHS       = 60
-LR           = 1e-3
-HIDDEN_DIM   = 128
+EPOCHS       = 80
+LR           = 5e-4
+HIDDEN_DIM   = 256
 NUM_LAYERS   = 2
-DROPOUT      = 0.3
+DROPOUT      = 0.5
 TRAIN_CUTOFF = 2010     # storms <= this year = train; > this year = test
-DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 
 # ─────────────────────────────────────────────
@@ -96,7 +96,7 @@ def load_data() -> pd.DataFrame:
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add derived features per storm."""
     groups = []
-    for sid, grp in df.groupby("storm_id", sort=False):
+    for _, grp in df.groupby("storm_id", sort=False):
         grp = grp.copy().reset_index(drop=True)
 
         # Displacements — used as prediction targets
@@ -118,6 +118,11 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         grp["sin_month"] = np.sin(2 * np.pi * month / 12)
         grp["cos_month"] = np.cos(2 * np.pi * month / 12)
 
+        # Storm type and basin — strong predictors of intensity change
+        status_map = {"TD": 0, "TS": 1, "HU": 2, "EX": 3, "SS": 4, "SD": 5, "LO": 6}
+        grp["status_enc"] = grp["status"].map(status_map).fillna(0)
+        grp["is_atl"] = (grp["basin"] == "ATL").astype(float)
+
         groups.append(grp)
 
     out = pd.concat(groups, ignore_index=True)
@@ -138,6 +143,7 @@ INPUT_FEATURES = [
     "dlat", "dlon", "dwind",
     "trans_speed", "heading", "storm_age",
     "sin_hour", "cos_hour", "sin_month", "cos_month",
+    "status_enc", "is_atl",
 ]
 
 
@@ -172,11 +178,12 @@ def build_sequences(df: pd.DataFrame, scaler: StandardScaler = None, fit_scaler:
         for i in range(n - SEQ_LEN - HORIZON + 1):
             x_seq = grp[INPUT_FEATURES].values[i : i + SEQ_LEN]  # (SEQ_LEN, F)
 
-            future_dlat  = raw["dlat"].values[i + SEQ_LEN : i + SEQ_LEN + HORIZON]
-            future_dlon  = raw["dlon"].values[i + SEQ_LEN : i + SEQ_LEN + HORIZON]
-            future_dwind = raw["dwind"].values[i + SEQ_LEN : i + SEQ_LEN + HORIZON]
+            future_dlat     = raw["dlat"].values[i + SEQ_LEN : i + SEQ_LEN + HORIZON]
+            future_dlon     = raw["dlon"].values[i + SEQ_LEN : i + SEQ_LEN + HORIZON]
+            future_dwind    = raw["dwind"].values[i + SEQ_LEN : i + SEQ_LEN + HORIZON]
+            future_wind_abs = raw["max_wind"].values[i + SEQ_LEN : i + SEQ_LEN + HORIZON]
 
-            y = np.concatenate([future_dlat, future_dlon, future_dwind]).astype(np.float32)
+            y = np.concatenate([future_dlat, future_dlon, future_dwind, future_wind_abs]).astype(np.float32)
             if np.any(np.isnan(y)):
                 continue
 
@@ -210,9 +217,10 @@ class HurricaneDataset(Dataset):
 
 class HurricaneLSTM(nn.Module):
     """
-    Shared LSTM encoder -> two task heads:
+    Shared LSTM encoder -> attention pooling -> three task heads:
       - track head:     predicts dlat + dlon for each horizon step
-      - intensity head: predicts dwind for each horizon step
+      - intensity head: predicts dwind (delta) for each horizon step
+      - wind_abs head:  predicts absolute max_wind for each horizon step
     """
     def __init__(self, input_dim, hidden_dim, num_layers, dropout, horizon):
         super().__init__()
@@ -223,7 +231,8 @@ class HurricaneLSTM(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0,
         )
-        self.dropout = nn.Dropout(dropout)
+        self.dropout  = nn.Dropout(dropout)
+        self.attn     = nn.Linear(hidden_dim, 1)      # attention scorer
 
         self.track_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -235,34 +244,55 @@ class HurricaneLSTM(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, horizon),       # dwind per step
         )
+        self.wind_abs_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, horizon),       # absolute max_wind per step
+        )
 
     def forward(self, x):
-        _, (h, _) = self.lstm(x)
-        h_last    = self.dropout(h[-1])               # last layer hidden state
-        track     = self.track_head(h_last)           # (B, 2*HORIZON)
-        intensity = self.intensity_head(h_last)       # (B, HORIZON)
-        return track, intensity
+        out, _ = self.lstm(x)                          # (B, SEQ_LEN, H)
+        scores  = self.attn(out).squeeze(-1)           # (B, SEQ_LEN)
+        weights = torch.softmax(scores, dim=1).unsqueeze(-1)
+        context = (out * weights).sum(dim=1)           # (B, H) — attended summary
+        context = self.dropout(context)
+
+        track    = self.track_head(context)            # (B, 2*HORIZON)
+        intensity = self.intensity_head(context)       # (B, HORIZON)
+        wind_abs  = self.wind_abs_head(context)        # (B, HORIZON)
+        return track, intensity, wind_abs
 
 
 # ─────────────────────────────────────────────
 # 6.  TRAINING
 # ─────────────────────────────────────────────
 
-def train(model, loader, optimizer, criterion):
+def train(model, loader, optimizer, huber_track, huber_intensity):
     model.train()
     total_loss = 0
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
 
-        dlat  = y_batch[:, :HORIZON]
-        dlon  = y_batch[:, HORIZON:2*HORIZON]
-        dwind = y_batch[:, 2*HORIZON:]
+        dlat     = y_batch[:, :HORIZON]
+        dlon     = y_batch[:, HORIZON:2*HORIZON]
+        dwind    = y_batch[:, 2*HORIZON:3*HORIZON]
+        wind_abs = y_batch[:, 3*HORIZON:]
         track_target = torch.cat([dlat, dlon], dim=1)
 
         optimizer.zero_grad()
-        track_pred, intensity_pred = model(X_batch)
+        track_pred, intensity_pred, wind_abs_pred = model(X_batch)
 
-        loss = criterion(track_pred, track_target) + criterion(intensity_pred, dwind)
+        loss_track = huber_track(track_pred, track_target)
+
+        # Sample-weight intensity loss by magnitude of actual wind change
+        dwind_mag   = dwind.abs().mean(dim=1)
+        weights     = (1.0 + 3.0 * dwind_mag / (dwind_mag.max() + 1e-8)).detach()
+        loss_dwind  = (weights * (intensity_pred - dwind).pow(2).mean(dim=1)).mean()
+
+        # Auxiliary absolute wind head — downweighted to avoid dominating
+        loss_wind_abs = huber_intensity(wind_abs_pred, wind_abs)
+
+        loss = loss_track + loss_dwind + 0.1 * loss_wind_abs
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -270,37 +300,49 @@ def train(model, loader, optimizer, criterion):
     return total_loss / len(loader)
 
 
-def evaluate(model, loader, criterion):
+def evaluate(model, loader, huber_track, huber_intensity):
     model.eval()
     total_loss = 0
-    all_track_pred, all_track_true = [], []
-    all_wind_pred,  all_wind_true  = [], []
+    all_track_pred, all_track_true   = [], []
+    all_wind_pred,  all_wind_true    = [], []
+    all_wind_abs_pred, all_wind_abs_true = [], []
 
     with torch.no_grad():
         for X_batch, y_batch in loader:
             X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
 
-            dlat  = y_batch[:, :HORIZON]
-            dlon  = y_batch[:, HORIZON:2*HORIZON]
-            dwind = y_batch[:, 2*HORIZON:]
+            dlat     = y_batch[:, :HORIZON]
+            dlon     = y_batch[:, HORIZON:2*HORIZON]
+            dwind    = y_batch[:, 2*HORIZON:3*HORIZON]
+            wind_abs = y_batch[:, 3*HORIZON:]
             track_target = torch.cat([dlat, dlon], dim=1)
 
-            track_pred, intensity_pred = model(X_batch)
+            track_pred, intensity_pred, wind_abs_pred = model(X_batch)
 
-            loss = criterion(track_pred, track_target) + criterion(intensity_pred, dwind)
+            dwind_mag     = dwind.abs().mean(dim=1)
+            weights       = (1.0 + 3.0 * dwind_mag / (dwind_mag.max() + 1e-8)).detach()
+            loss_dwind    = (weights * (intensity_pred - dwind).pow(2).mean(dim=1)).mean()
+            loss          = (huber_track(track_pred, track_target)
+                             + loss_dwind
+                             + 0.1 * huber_intensity(wind_abs_pred, wind_abs))
             total_loss += loss.item()
 
             all_track_pred.append(track_pred.cpu().numpy())
             all_track_true.append(track_target.cpu().numpy())
             all_wind_pred.append(intensity_pred.cpu().numpy())
             all_wind_true.append(dwind.cpu().numpy())
+            all_wind_abs_pred.append(wind_abs_pred.cpu().numpy())
+            all_wind_abs_true.append(wind_abs.cpu().numpy())
 
-    track_pred_np = np.concatenate(all_track_pred)
-    track_true_np = np.concatenate(all_track_true)
-    wind_pred_np  = np.concatenate(all_wind_pred)
-    wind_true_np  = np.concatenate(all_wind_true)
-
-    return total_loss / len(loader), track_pred_np, track_true_np, wind_pred_np, wind_true_np
+    return (
+        total_loss / len(loader),
+        np.concatenate(all_track_pred),
+        np.concatenate(all_track_true),
+        np.concatenate(all_wind_pred),
+        np.concatenate(all_wind_true),
+        np.concatenate(all_wind_abs_pred),
+        np.concatenate(all_wind_abs_true),
+    )
 
 
 # ─────────────────────────────────────────────
@@ -366,19 +408,22 @@ def main():
     ).to(DEVICE)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-    criterion = nn.MSELoss()
+    optimizer    = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler    = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.7, min_lr=1e-5)
+    huber_track     = nn.HuberLoss(delta=1.0)
+    huber_intensity = nn.HuberLoss(delta=10.0)
 
     # Training loop
     train_losses, test_losses = [], []
-    best_test_loss = float("inf")
-    best_state     = None
+    best_test_loss  = float("inf")
+    best_state      = None
+    patience_count  = 0
+    EARLY_STOP      = 20   # stop if test loss hasn't improved for this many epochs
 
     print("Training...")
     for epoch in range(1, EPOCHS + 1):
-        tr_loss     = train(model, train_loader, optimizer, criterion)
-        te_loss, *_ = evaluate(model, test_loader, criterion)
+        tr_loss     = train(model, train_loader, optimizer, huber_track, huber_intensity)
+        te_loss, *_ = evaluate(model, test_loader, huber_track, huber_intensity)
         scheduler.step(te_loss)
 
         train_losses.append(tr_loss)
@@ -387,14 +432,22 @@ def main():
         if te_loss < best_test_loss:
             best_test_loss = te_loss
             best_state     = {k: v.clone() for k, v in model.state_dict().items()}
+            patience_count = 0
+        else:
+            patience_count += 1
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:3d}/{EPOCHS}  |  Train Loss: {tr_loss:.4f}  |  "
                   f"Test Loss: {te_loss:.4f}  |  LR: {optimizer.param_groups[0]['lr']:.2e}")
 
+        if patience_count >= EARLY_STOP:
+            print(f"\n  Early stopping at epoch {epoch} (no improvement for {EARLY_STOP} epochs)")
+            break
+
     # Evaluate best model
     model.load_state_dict(best_state)
-    _, track_pred, track_true, wind_pred, wind_true = evaluate(model, test_loader, criterion)
+    _, track_pred, track_true, wind_pred, wind_true, wind_abs_pred, wind_abs_true = \
+        evaluate(model, test_loader, huber_track, huber_intensity)
 
     pred_dlat = track_pred[:, :HORIZON]
     pred_dlon = track_pred[:, HORIZON:]
@@ -404,28 +457,31 @@ def main():
     print("\n--- Results ---")
     horizons = [6, 12, 18, 24]
     for h_idx, h_hr in enumerate(horizons):
-        w_rmse    = rmse(wind_pred[:, h_idx], wind_true[:, h_idx])
-        dlat_rmse = rmse(pred_dlat[:, h_idx], true_dlat[:, h_idx])
-        dlon_rmse = rmse(pred_dlon[:, h_idx], true_dlon[:, h_idx])
-        print(f"  +{h_hr:2d}h  |  Wind RMSE: {w_rmse:5.2f} kt  |  "
-              f"Track RMSE (deg): dlat={dlat_rmse:.4f}  dlon={dlon_rmse:.4f}")
+        w_rmse      = rmse(wind_pred[:, h_idx],     wind_true[:, h_idx])
+        wabs_rmse   = rmse(wind_abs_pred[:, h_idx], wind_abs_true[:, h_idx])
+        dlat_rmse   = rmse(pred_dlat[:, h_idx],     true_dlat[:, h_idx])
+        dlon_rmse   = rmse(pred_dlon[:, h_idx],     true_dlon[:, h_idx])
+        print(f"  +{h_hr:2d}h  |  dWind RMSE: {w_rmse:5.2f} kt  |  "
+              f"Abs Wind RMSE: {wabs_rmse:5.2f} kt  |  "
+              f"Track (deg): dlat={dlat_rmse:.4f}  dlon={dlon_rmse:.4f}")
 
-    print(f"\n  Overall Wind RMSE: {rmse(wind_pred, wind_true):.2f} kt")
+    print(f"\n  Overall dWind RMSE:   {rmse(wind_pred, wind_true):.2f} kt")
+    print(f"  Overall Abs Wind RMSE: {rmse(wind_abs_pred, wind_abs_true):.2f} kt")
     print("---\n")
 
     # Plots
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
 
     # Loss curves
     axes[0].plot(train_losses, label="Train")
     axes[0].plot(test_losses,  label="Test")
     axes[0].set_title("Loss Curves")
     axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("MSE Loss")
+    axes[0].set_ylabel("Loss")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    # Wind prediction scatter (+24h)
+    # dWind scatter (+24h)
     axes[1].scatter(wind_true[:500, -1], wind_pred[:500, -1], alpha=0.3, s=10)
     lim = max(abs(wind_true[:, -1]).max(), abs(wind_pred[:, -1]).max()) * 1.1
     axes[1].plot([-lim, lim], [-lim, lim], "r--", lw=1)
@@ -434,13 +490,31 @@ def main():
     axes[1].set_ylabel("Pred Dwind (kt)")
     axes[1].grid(True, alpha=0.3)
 
-    # RMSE by horizon
-    wind_rmses = [rmse(wind_pred[:, h], wind_true[:, h]) for h in range(HORIZON)]
-    axes[2].bar(horizons, wind_rmses, color="steelblue")
-    axes[2].set_title("Wind RMSE by Forecast Horizon")
-    axes[2].set_xlabel("Lead Time (h)")
-    axes[2].set_ylabel("RMSE (kt)")
-    axes[2].grid(True, alpha=0.3, axis="y")
+    # Absolute wind scatter (+24h)
+    axes[2].scatter(wind_abs_true[:500, -1], wind_abs_pred[:500, -1], alpha=0.3, s=10)
+    lim2 = max(wind_abs_true[:, -1].max(), wind_abs_pred[:, -1].max()) * 1.1
+    axes[2].plot([0, lim2], [0, lim2], "r--", lw=1)
+    axes[2].set_title("Abs Wind Pred vs True (+24h)")
+    axes[2].set_xlabel("True Wind (kt)")
+    axes[2].set_ylabel("Pred Wind (kt)")
+    axes[2].grid(True, alpha=0.3)
+
+    # RMSE by horizon — all three metrics
+    dwind_rmses   = [rmse(wind_pred[:, h],     wind_true[:, h])     for h in range(HORIZON)]
+    abswind_rmses = [rmse(wind_abs_pred[:, h], wind_abs_true[:, h]) for h in range(HORIZON)]
+    dlat_rmses    = [rmse(pred_dlat[:, h],     true_dlat[:, h])     for h in range(HORIZON)]
+    dlon_rmses    = [rmse(pred_dlon[:, h],     true_dlon[:, h])     for h in range(HORIZON)]
+
+    ax = axes[3]
+    ax.plot(horizons, dwind_rmses,   marker="o", label="dWind (kt)")
+    ax.plot(horizons, abswind_rmses, marker="o", label="Abs Wind (kt)")
+    ax.plot(horizons, dlat_rmses,    marker="s", label="dlat (°)", linestyle="--")
+    ax.plot(horizons, dlon_rmses,    marker="s", label="dlon (°)", linestyle="--")
+    ax.set_title("RMSE by Forecast Horizon")
+    ax.set_xlabel("Lead Time (h)")
+    ax.set_ylabel("RMSE")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plot_path = os.path.join(BASE, "lstm_results.png")
