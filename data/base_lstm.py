@@ -16,6 +16,9 @@ import warnings
 import os
 warnings.filterwarnings("ignore")
 
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 # ─────────────────────────────────────────────
 # CONFIG
